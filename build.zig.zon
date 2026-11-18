@@ -1,0 +1,29 @@
+.{
+    .name = .zfulltext,
+    .version = "0.1.0",
+    .fingerprint = 0x126b26e335a6db87,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .wiskdb = .{
+            .url = "git+https://github.com/lovez-dev/wiskdb.git#5527ac12984826fae9eb800d5508f40e09ca2769",
+            .hash = "wiskdb-0.1.0-U8j_dBLkCwCPEpU8i-kLEDB9fjc2ge5XcDPU1z8PSvvc",
+        },
+        .zlap = .{
+            .url = "git+https://github.com/lovez-dev/zlap.git#a5a8149c80900eab4058c570c1bc9c63a54ae68b",
+            .hash = "zlap-0.1.0-o7HR1PiEAAAVAHF0gTcqp9tLjQWaK7dTI35SN55n_Ggb",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        ".zigversion",
+        "LICENSE",
+        "README.md",
+        "examples",
+        "bench",
+        "docs",
+        "src",
+        "tests",
+    },
+}
