@@ -19,6 +19,8 @@ exe.root_module.addImport("zfulltext", zfulltext.module("zfulltext"));
 
 The library uses pinned wiskdb at runtime. zfulltext's own zlap dependency is only enabled by `zig build bench -Dbench=true`; the pinned wiskdb package may still resolve zlap as a transitive build dependency.
 
+New indexes store compact scoring metadata. Older layout-1 indexes remain readable, and their first successful upsert upgrades the layout atomically; older binaries then cannot reopen the index. Legacy documents gain the faster scoring path when upserted. See [index compatibility](docs/api.md#package-and-lifecycle).
+
 ## Usage
 
 See [`examples/basic.zig`](examples/basic.zig) for a runnable create/insert/query/update/delete/get/cleanup flow. From the repository root run `zig build example`. A minimal use looks like:

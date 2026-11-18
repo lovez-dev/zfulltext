@@ -124,6 +124,7 @@ test "Index enforces a lower read limit when reopening existing documents" {
     defer index.deinit();
     try t.expectError(error.RecordTooLarge, index.get(t.allocator, 3));
     try t.expectError(error.RecordTooLarge, index.search(t.allocator, "document", .{ .limit = 1 }));
+    try t.expectError(error.RecordTooLarge, index.search(t.allocator, "document", .{ .limit = 0 }));
 }
 
 fn searchWithAllocator(allocator: std.mem.Allocator, index: *zft.Index) !void {

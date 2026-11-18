@@ -9,7 +9,8 @@ const scoring = @import("scoring.zig");
 
 const schema_magic = "ZFTI";
 const analyzer_version: u8 = 1;
-const schema = schema_magic ++ &[_]u8{ codec.format_version, analyzer_version };
+const legacy_schema = schema_magic ++ &[_]u8{ 1, analyzer_version };
+const schema = schema_magic ++ &[_]u8{ 2, analyzer_version };
 const bootstrap_marker_name = ".zfulltext-init";
 const bootstrap_marker = "zfulltext bootstrap v1";
 const max_document_bytes = 1024 * 1024;
@@ -31,10 +32,14 @@ pub const Index = struct {
     corpus: codec.CorpusStats = .{ .document_count = 0, .total_length = 0 },
     closed: bool = false,
     poisoned: bool = false,
+    has_scoring_metadata: bool = true,
 
     pub const testing = if (builtin.is_test) struct {
         pub fn failBootstrap(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Index {
             return openImpl(allocator, io, path, .{ .create_if_missing = true }, true);
+        }
+        pub fn upsertWithAllocator(index: *Index, allocator: std.mem.Allocator, id: u64, text: []const u8) !void {
+            _ = try index.mutateWithAllocator(allocator, id, text);
         }
     } else struct {};
 
@@ -174,7 +179,8 @@ pub const Index = struct {
         if (try self.db.get(codec.schema_key)) |header| {
             defer self.db.allocator.free(header);
             if (header.len != schema.len or !std.mem.startsWith(u8, header, schema_magic)) return error.CorruptRecord;
-            if (!std.mem.eql(u8, header, schema)) return error.UnsupportedVersion;
+            self.has_scoring_metadata = std.mem.eql(u8, header, schema);
+            if (!self.has_scoring_metadata and !std.mem.eql(u8, header, legacy_schema)) return error.UnsupportedVersion;
             const value = try self.db.get(codec.statistics_key) orelse return error.CorruptRecord;
             defer self.db.allocator.free(value);
             self.corpus = try codec.decodeStats(value);
@@ -240,7 +246,7 @@ pub const Index = struct {
         if (text.len > self.options.max_query_bytes) return error.QueryTooLarge;
         if (options.limit > self.options.max_result_count) return error.InvalidLimit;
         try scoring.validateParameters(options.k1, options.b);
-        return query.search(&self.db, allocator, text, options, self.corpus, self.options.max_document_bytes);
+        return query.search(&self.db, allocator, text, options, self.corpus, self.options.max_document_bytes, self.has_scoring_metadata);
     }
 
     fn checkUsable(self: *const Index) !void {
@@ -261,12 +267,16 @@ pub const Index = struct {
     }
 
     fn mutate(self: *Index, id: u64, text: ?[]const u8) !bool {
+        return self.mutateWithAllocator(self.allocator, id, text);
+    }
+
+    fn mutateWithAllocator(self: *Index, scratch_allocator: std.mem.Allocator, id: u64, text: ?[]const u8) !bool {
         try self.lock.lock(self.io);
         defer self.lock.unlock(self.io);
         try self.checkUsable();
         if (text) |value| if (value.len > self.options.max_document_bytes) return error.DocumentTooLarge;
 
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(scratch_allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
         const key = try codec.documentKey(allocator, id);
@@ -280,6 +290,12 @@ pub const Index = struct {
             next.total_length -= record.logical_length;
         }
         var batch: Batch = .{};
+        // Publish the new schema in the same batch to exclude older writers
+        // that would update documents without maintaining their scoring metadata.
+        const upgrade_schema = !self.has_scoring_metadata and text != null;
+        if (upgrade_schema) try batch.add(allocator, .{ .put = .{ .key = codec.schema_key, .value = schema } });
+        const scoring_key = codec.scoringKey(id);
+        var metadata: [8]u8 = undefined;
         var new_tokens: []analysis.Token = &.{};
         if (text) |value| {
             const analyzed = try analysis.analyzeDocument(allocator, value);
@@ -288,8 +304,14 @@ pub const Index = struct {
             next.total_length = std.math.add(u64, next.total_length, analyzed.logical_length) catch return error.CorpusTooLarge;
             const encoded = try codec.encodeDocument(allocator, value, new_tokens, analyzed.logical_length);
             try batch.add(allocator, .{ .put = .{ .key = key, .value = encoded } });
+            metadata = (codec.ScoringMetadata{
+                .text_bytes = @intCast(value.len),
+                .logical_length = @intCast(analyzed.logical_length),
+            }).encode();
+            try batch.add(allocator, .{ .put = .{ .key = &scoring_key, .value = &metadata } });
         } else {
             try batch.add(allocator, .{ .del = key });
+            if (self.has_scoring_metadata) try batch.add(allocator, .{ .del = &scoring_key });
         }
         std.mem.sortUnstable(analysis.Token, new_tokens, {}, tokenLessThan);
         const old_tokens: []analysis.Token = if (previous) |record| record.tokens else &.{};
@@ -304,6 +326,7 @@ pub const Index = struct {
             return err;
         };
         self.corpus = next;
+        self.has_scoring_metadata = self.has_scoring_metadata or upgrade_schema;
         return previous != null;
     }
 };

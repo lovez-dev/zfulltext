@@ -34,7 +34,7 @@ pub fn checkCancel(io: std.Io, cancel: ?*const types.Cancellation) !void {
     try io.checkCancel();
 }
 
-pub fn search(db: *wiskdb.Db, allocator: std.mem.Allocator, text: []const u8, options: types.SearchOptions, corpus: codec.CorpusStats, max_document_bytes: usize) !types.SearchResult {
+pub fn search(db: *wiskdb.Db, allocator: std.mem.Allocator, text: []const u8, options: types.SearchOptions, corpus: codec.CorpusStats, max_document_bytes: usize, has_scoring_metadata: bool) !types.SearchResult {
     const query: Query = .{ .db = db, .options = options };
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -81,7 +81,9 @@ pub fn search(db: *wiskdb.Db, allocator: std.mem.Allocator, text: []const u8, op
         const matches = candidate.items;
         if (options.mode != .any and matches.len != terms.items.len) continue;
         if (options.mode == .phrase and !try matchesPhrase(query, tokens, token_terms, terms.items, matches)) continue;
-        const hit = try scoreCandidate(query, scratch, first.id, max_document_bytes, corpus, average_length, terms.items, matches);
+        const length = try readScoringLength(query, first.id, max_document_bytes, has_scoring_metadata);
+        if (length > corpus.total_length) return error.CorruptRecord;
+        const hit = try scoreCandidate(query, first.id, length, average_length, terms.items, matches);
         total = std.math.add(usize, total, 1) catch return error.ResultCountOverflow;
         if (options.limit == 0) continue;
         if (best.count() < options.limit) {
@@ -90,6 +92,14 @@ pub fn search(db: *wiskdb.Db, allocator: std.mem.Allocator, text: []const u8, op
             _ = best.pop();
             try best.push(scratch, hit);
         }
+    }
+    // Validate complete records only for returned hits, rather than every
+    // candidate. This retains document validation on retrieval without making
+    // frequent-term scoring proportional to the size of candidate bodies.
+    for (best.items) |hit| {
+        try query.check();
+        const length = try readDocumentLength(query, hit.id, max_document_bytes);
+        if (length != try readScoringLength(query, hit.id, max_document_bytes, has_scoring_metadata)) return error.CorruptRecord;
     }
     try query.check();
     const hits = try allocator.dupe(types.Hit, best.items);
@@ -155,14 +165,28 @@ fn comparePosition(key: u64, element: u64) std.math.Order {
     return std.math.order(key, element);
 }
 
-fn scoreCandidate(query: Query, allocator: std.mem.Allocator, id: u64, max_document_bytes: usize, corpus: codec.CorpusStats, average_length: f64, terms: []const Term, matches: []const Cursor) !types.Hit {
-    const key = try codec.documentKey(allocator, id);
-    defer allocator.free(key);
-    const value = try query.db.get(key) orelse return error.CorruptRecord;
+fn readScoringLength(query: Query, id: u64, max_document_bytes: usize, has_scoring_metadata: bool) !u64 {
+    if (has_scoring_metadata) {
+        const metadata_key = codec.scoringKey(id);
+        if (try query.db.get(&metadata_key)) |value| {
+            defer query.db.allocator.free(value);
+            try query.check();
+            return (try codec.ScoringMetadata.decode(value, max_document_bytes)).logical_length;
+        }
+    }
+    // Older documents can be read without rebuilding or rewriting the index.
+    return readDocumentLength(query, id, max_document_bytes);
+}
+
+fn readDocumentLength(query: Query, id: u64, max_document_bytes: usize) !u64 {
+    const key = codec.documentKeyBytes(id);
+    const value = try query.db.get(&key) orelse return error.CorruptRecord;
     defer query.db.allocator.free(value);
     try query.check();
-    const length = try codec.decodeDocumentLength(value, max_document_bytes);
-    if (length > corpus.total_length) return error.CorruptRecord;
+    return codec.decodeDocumentLength(value, max_document_bytes);
+}
+
+fn scoreCandidate(query: Query, id: u64, length: u64, average_length: f64, terms: []const Term, matches: []const Cursor) !types.Hit {
     var score: f64 = 0;
     for (matches, 0..) |cursor, i| {
         if (i % 64 == 0) try query.check();

@@ -118,7 +118,7 @@ test "Index.open preserves application rows in a marked store with no schema" {
     try t.expect((try db.get(zft.codec.schema_key)) == null);
 }
 
-test "Index.search and Index.get reject invalid UTF-8 in an existing document" {
+test "Search results and get reject invalid UTF-8 in stored text" {
     const tmp = try TempIndex.init();
     defer tmp.deinit();
     const text = "term term";
@@ -151,6 +151,140 @@ test "Index.search and Index.get reject invalid UTF-8 in an existing document" {
     try t.expectError(error.InvalidUtf8, index.get(t.allocator, 1));
 }
 
+test "Search rejects legacy documents with invalid UTF-8" {
+    const tmp = try TempIndex.init();
+    defer tmp.deinit();
+    {
+        const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{ .create_if_missing = true });
+        defer index.deinit();
+        try index.upsert(1, "term");
+        try index.close();
+    }
+    {
+        const dir = try std.Io.Dir.cwd().openDir(t.io, &tmp.path, .{ .iterate = true });
+        defer dir.close(t.io);
+        var db = try wiskdb.Db.open(t.allocator, t.io, dir, .{});
+        defer db.deinit();
+        const key = zft.codec.documentKeyBytes(1);
+        const value = (try db.get(&key)) orelse return error.MissingDocument;
+        defer db.allocator.free(value);
+        const corrupt = try t.allocator.dupe(u8, value);
+        defer t.allocator.free(corrupt);
+        corrupt[zft.codec.document_magic.len + 1 + 8 + 4] = 0xff;
+        try db.put(&key, corrupt);
+        try db.delete(&zft.codec.scoringKey(1));
+        try db.put(zft.codec.schema_key, "ZFTI\x01\x01");
+        try db.close();
+    }
+    const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{});
+    defer index.deinit();
+    try t.expectError(error.InvalidUtf8, index.search(t.allocator, "term", .{}));
+}
+
+test "Legacy scoring metadata upgrades atomically and survives replacements and deletes" {
+    const tmp = try TempIndex.init();
+    defer tmp.deinit();
+    const texts = [_][]const u8{ "term term", "term filler filler filler", "rare filler" };
+    var expected_hits: [2]zft.Hit = undefined;
+    {
+        const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{ .create_if_missing = true });
+        defer index.deinit();
+        for (texts, 0..) |text, id| try index.upsert(id, text);
+        var result = try index.search(t.allocator, "term", .{});
+        defer result.deinit(t.allocator);
+        try t.expectEqual(@as(usize, 2), result.hits.len);
+        @memcpy(&expected_hits, result.hits);
+        try index.close();
+    }
+    // Make a real legacy store: no metadata records and the original schema.
+    {
+        const dir = try std.Io.Dir.cwd().openDir(t.io, &tmp.path, .{ .iterate = true });
+        defer dir.close(t.io);
+        var db = try wiskdb.Db.open(t.allocator, t.io, dir, .{});
+        defer db.deinit();
+        for (0..texts.len) |id| try db.delete(&zft.codec.scoringKey(id));
+        try db.put(zft.codec.schema_key, "ZFTI\x01\x01");
+        try db.close();
+    }
+    {
+        var failing = t.FailingAllocator.init(t.allocator, .{});
+        const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{});
+        defer index.deinit();
+        var original = try index.search(t.allocator, "term", .{});
+        defer original.deinit(t.allocator);
+        try t.expectEqualDeep(expected_hits[0..], original.hits);
+        failing.fail_index = failing.alloc_index;
+        try t.expectError(error.OutOfMemory, zft.Index.testing.upsertWithAllocator(index, failing.allocator(), 0, texts[0]));
+        failing.fail_index = std.math.maxInt(usize);
+        // This replacement upgrades only one document; the others stay legacy.
+        try index.upsert(0, texts[0]);
+        var mixed = try index.search(t.allocator, "term", .{});
+        defer mixed.deinit(t.allocator);
+        try t.expectEqualDeep(expected_hits[0..], mixed.hits);
+        try index.close();
+    }
+    {
+        const dir = try std.Io.Dir.cwd().openDir(t.io, &tmp.path, .{ .iterate = true });
+        defer dir.close(t.io);
+        var db = try wiskdb.Db.open(t.allocator, t.io, dir, .{});
+        defer db.deinit();
+        const header = (try db.get(zft.codec.schema_key)) orelse return error.MissingSchema;
+        defer db.allocator.free(header);
+        try t.expectEqualStrings("ZFTI\x02\x01", header);
+        const metadata = (try db.get(&zft.codec.scoringKey(0))) orelse return error.MissingMetadata;
+        defer db.allocator.free(metadata);
+        try t.expectEqual(@as(u32, 2), (try zft.codec.ScoringMetadata.decode(metadata, 100)).logical_length);
+        try t.expect((try db.get(&zft.codec.scoringKey(1))) == null);
+        try db.close();
+    }
+    {
+        const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{});
+        defer index.deinit();
+        var reopened = try index.search(t.allocator, "term", .{});
+        defer reopened.deinit(t.allocator);
+        try t.expectEqualDeep(expected_hits[0..], reopened.hits);
+        try index.upsert(0, "replacement");
+        try t.expect(try index.delete(0));
+        try t.expect(try index.delete(1));
+        try t.expect(!(try index.delete(0)));
+        try index.close();
+    }
+    {
+        const dir = try std.Io.Dir.cwd().openDir(t.io, &tmp.path, .{ .iterate = true });
+        defer dir.close(t.io);
+        var db = try wiskdb.Db.open(t.allocator, t.io, dir, .{});
+        defer db.deinit();
+        try t.expect((try db.get(&zft.codec.scoringKey(0))) == null);
+        try t.expect((try db.get(&zft.codec.scoringKey(1))) == null);
+        try db.close();
+    }
+}
+
+test "Search rejects corrupt scoring metadata while get still validates the document" {
+    const tmp = try TempIndex.init();
+    defer tmp.deinit();
+    {
+        const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{ .create_if_missing = true });
+        defer index.deinit();
+        try index.upsert(1, "term");
+        try index.close();
+    }
+    {
+        const dir = try std.Io.Dir.cwd().openDir(t.io, &tmp.path, .{ .iterate = true });
+        defer dir.close(t.io);
+        var db = try wiskdb.Db.open(t.allocator, t.io, dir, .{});
+        defer db.deinit();
+        try db.put(&zft.codec.scoringKey(1), "malformed");
+        try db.close();
+    }
+    const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{});
+    defer index.deinit();
+    try t.expectError(error.CorruptRecord, index.search(t.allocator, "term", .{}));
+    var doc = (try index.get(t.allocator, 1)) orelse return error.MissingDocument;
+    defer doc.deinit(t.allocator);
+    try t.expectEqualStrings("term", doc.text);
+}
+
 test "Index rejects invalid limits, writer conflicts and oversized documents" {
     const tmp = try TempIndex.init();
     defer tmp.deinit();
@@ -170,11 +304,11 @@ test "Index mutation OOM leaves acknowledged state unchanged" {
     defer tmp.deinit();
     var failing = t.FailingAllocator.init(t.allocator, .{});
     const allocator = failing.allocator();
-    const index = try zft.Index.open(allocator, t.io, &tmp.path, .{ .create_if_missing = true });
+    const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{ .create_if_missing = true });
     defer index.deinit();
     const fail_index = failing.alloc_index;
     failing.fail_index = fail_index;
-    try t.expectError(error.OutOfMemory, index.upsert(1, "new term"));
+    try t.expectError(error.OutOfMemory, zft.Index.testing.upsertWithAllocator(index, allocator, 1, "new term"));
     failing.fail_index = std.math.maxInt(usize);
     try t.expectEqual(zft.Stats{ .document_count = 0, .total_length = 0 }, try index.stats());
     try t.expect((try index.get(t.allocator, 1)) == null);

@@ -34,6 +34,38 @@ pub const Posting = struct {
 
 pub const CorpusStats = struct { document_count: u64, total_length: u64 };
 
+pub const ScoringMetadata = struct {
+    text_bytes: u32,
+    logical_length: u32,
+
+    pub fn encode(self: ScoringMetadata) [8]u8 {
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(u32, value[0..4], self.text_bytes, .big);
+        std.mem.writeInt(u32, value[4..8], self.logical_length, .big);
+        return value;
+    }
+
+    pub fn decode(value: []const u8, max_bytes: usize) !ScoringMetadata {
+        if (value.len != 8) return error.CorruptRecord;
+        const text_bytes = std.mem.readInt(u32, value[0..4], .big);
+        const logical_length = std.mem.readInt(u32, value[4..8], .big);
+        if (text_bytes > max_bytes) return error.RecordTooLarge;
+        if (logical_length > text_bytes) return error.CorruptRecord;
+        return .{ .text_bytes = text_bytes, .logical_length = logical_length };
+    }
+};
+
+pub fn scoringKey(document_id: u64) [9]u8 {
+    return documentNamespaceKey(0x11, document_id);
+}
+
+fn documentNamespaceKey(prefix: u8, document_id: u64) [9]u8 {
+    var key: [9]u8 = undefined;
+    key[0] = prefix;
+    std.mem.writeInt(u64, key[1..9], document_id, .big);
+    return key;
+}
+
 const Writer = struct {
     allocator: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
@@ -213,14 +245,15 @@ pub fn decodePosting(allocator: std.mem.Allocator, bytes: []const u8, max_positi
     return .{ .document_id = document_id, .positions = positions };
 }
 
-/// Encode a term as escaped bytes, a two-byte terminator, and a big-endian ID.
 pub fn documentKey(allocator: std.mem.Allocator, document_id: u64) ![]u8 {
-    var key: [9]u8 = undefined;
-    key[0] = 0x10;
-    std.mem.writeInt(u64, key[1..9], document_id, .big);
-    return try allocator.dupe(u8, &key);
+    return allocator.dupe(u8, &documentKeyBytes(document_id));
 }
 
+pub fn documentKeyBytes(document_id: u64) [9]u8 {
+    return documentNamespaceKey(0x10, document_id);
+}
+
+/// Encode a term as escaped bytes, a two-byte terminator, and a big-endian ID.
 pub fn postingKey(allocator: std.mem.Allocator, term: []const u8, document_id: u64) ![]u8 {
     var key: std.ArrayList(u8) = .empty;
     errdefer key.deinit(allocator);
@@ -291,6 +324,25 @@ test "document round trip preserves bytes, terms, positions, and u64 extremes" {
     try std.testing.expectEqualStrings("raw text", decoded.text);
     try std.testing.expectEqual(@as(u64, 5), decoded.logical_length);
     try std.testing.expectEqualStrings("中", decoded.tokens[1].term);
+}
+
+test "scoring metadata validates bounds and preserves unsigned IDs" {
+    const value = (ScoringMetadata{ .text_bytes = 100, .logical_length = 42 }).encode();
+    const decoded = try ScoringMetadata.decode(&value, 100);
+    try std.testing.expectEqual(@as(u32, 42), decoded.logical_length);
+    try std.testing.expectEqual(@as(u32, 100), decoded.text_bytes);
+    try std.testing.expectError(error.RecordTooLarge, ScoringMetadata.decode(&value, 99));
+    try std.testing.expectError(error.CorruptRecord, ScoringMetadata.decode(value[0..7], 100));
+    const invalid = (ScoringMetadata{ .text_bytes = 2, .logical_length = 3 }).encode();
+    try std.testing.expectError(error.CorruptRecord, ScoringMetadata.decode(&invalid, 100));
+    const empty = (ScoringMetadata{ .text_bytes = 0, .logical_length = 0 }).encode();
+    try std.testing.expectEqual(@as(u32, 0), (try ScoringMetadata.decode(&empty, 100)).logical_length);
+    const low = scoringKey(0);
+    const high = scoringKey(std.math.maxInt(u64));
+    const doc = documentKeyBytes(0);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), std.mem.readInt(u64, high[1..9], .big));
+    try std.testing.expect(std.mem.order(u8, &low, &high) == .lt);
+    try std.testing.expect(!std.mem.eql(u8, &doc, &low));
 }
 
 test "posting encoding validates sorted positions and truncation" {
