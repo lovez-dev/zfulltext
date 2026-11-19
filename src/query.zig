@@ -98,8 +98,13 @@ pub fn search(db: *wiskdb.Db, allocator: std.mem.Allocator, text: []const u8, op
     // frequent-term scoring proportional to the size of candidate bodies.
     for (best.items) |hit| {
         try query.check();
-        const length = try readDocumentLength(query, hit.id, max_document_bytes);
-        if (length != try readScoringLength(query, hit.id, max_document_bytes, has_scoring_metadata)) return error.CorruptRecord;
+        const document = try readDocumentMetadata(query, hit.id, max_document_bytes);
+        if (has_scoring_metadata) {
+            if (try readScoringMetadata(query, hit.id, max_document_bytes)) |metadata| {
+                if (metadata.text_bytes != document.text_bytes or metadata.logical_length != document.logical_length)
+                    return error.CorruptRecord;
+            }
+        }
     }
     try query.check();
     const hits = try allocator.dupe(types.Hit, best.items);
@@ -167,23 +172,26 @@ fn comparePosition(key: u64, element: u64) std.math.Order {
 
 fn readScoringLength(query: Query, id: u64, max_document_bytes: usize, has_scoring_metadata: bool) !u64 {
     if (has_scoring_metadata) {
-        const metadata_key = codec.scoringKey(id);
-        if (try query.db.get(&metadata_key)) |value| {
-            defer query.db.allocator.free(value);
-            try query.check();
-            return (try codec.ScoringMetadata.decode(value, max_document_bytes)).logical_length;
-        }
+        if (try readScoringMetadata(query, id, max_document_bytes)) |metadata| return metadata.logical_length;
     }
     // Older documents can be read without rebuilding or rewriting the index.
-    return readDocumentLength(query, id, max_document_bytes);
+    return (try readDocumentMetadata(query, id, max_document_bytes)).logical_length;
 }
 
-fn readDocumentLength(query: Query, id: u64, max_document_bytes: usize) !u64 {
+fn readScoringMetadata(query: Query, id: u64, max_document_bytes: usize) !?codec.ScoringMetadata {
+    const key = codec.scoringKey(id);
+    const value = try query.db.get(&key) orelse return null;
+    defer query.db.allocator.free(value);
+    try query.check();
+    return try codec.ScoringMetadata.decode(value, max_document_bytes);
+}
+
+fn readDocumentMetadata(query: Query, id: u64, max_document_bytes: usize) !codec.ScoringMetadata {
     const key = codec.documentKeyBytes(id);
     const value = try query.db.get(&key) orelse return error.CorruptRecord;
     defer query.db.allocator.free(value);
     try query.check();
-    return codec.decodeDocumentLength(value, max_document_bytes);
+    return codec.decodeDocumentMetadata(value, max_document_bytes);
 }
 
 fn scoreCandidate(query: Query, id: u64, length: u64, average_length: f64, terms: []const Term, matches: []const Cursor) !types.Hit {

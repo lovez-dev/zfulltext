@@ -285,6 +285,68 @@ test "Search rejects corrupt scoring metadata while get still validates the docu
     try t.expectEqualStrings("term", doc.text);
 }
 
+test "Search rejects scoring metadata inconsistent with returned document bytes or length" {
+    const cases = [_]struct {
+        text: []const u8,
+        text_bytes: u32,
+        logical_length: u32 = 2,
+    }{
+        .{ .text = "term term", .text_bytes = 8 },
+        .{ .text = "term term", .text_bytes = 10 },
+        .{ .text = "term term", .text_bytes = 9, .logical_length = 3 },
+        .{ .text = "term \xe4\xb8\xad", .text_bytes = 6 },
+    };
+    for (cases) |case| {
+        const tmp = try TempIndex.init();
+        defer tmp.deinit();
+        var expected: zft.Hit = undefined;
+        {
+            const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{ .create_if_missing = true });
+            defer index.deinit();
+            try index.upsert(1, case.text);
+            try index.upsert(2, "filler filler");
+            var result = try index.search(t.allocator, "term", .{ .limit = 1 });
+            defer result.deinit(t.allocator);
+            try t.expectEqual(@as(usize, 1), result.total);
+            try t.expectEqual(@as(usize, 1), result.hits.len);
+            expected = result.hits[0];
+            try index.close();
+        }
+        {
+            const dir = try std.Io.Dir.cwd().openDir(t.io, &tmp.path, .{ .iterate = true });
+            defer dir.close(t.io);
+            var db = try wiskdb.Db.open(t.allocator, t.io, dir, .{});
+            defer db.deinit();
+            // Each record passes its own bounds checks but disagrees with the document.
+            const encoded = (zft.codec.ScoringMetadata{
+                .text_bytes = case.text_bytes,
+                .logical_length = case.logical_length,
+            }).encode();
+            _ = try zft.codec.ScoringMetadata.decode(&encoded, 100);
+            try db.put(&zft.codec.scoringKey(1), &encoded);
+            try db.close();
+        }
+        const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{});
+        defer index.deinit();
+        for ([_]zft.MatchMode{ .all, .any, .phrase }) |mode| {
+            if (index.search(t.allocator, "term", .{ .mode = mode, .limit = 1 })) |result| {
+                var unexpected = result;
+                unexpected.deinit(t.allocator);
+                return error.TestExpectedError;
+            } else |err| try t.expectEqual(error.CorruptRecord, err);
+        }
+        var doc = (try index.get(t.allocator, 1)) orelse return error.MissingDocument;
+        defer doc.deinit(t.allocator);
+        try t.expectEqualStrings(case.text, doc.text);
+        try index.upsert(1, case.text);
+        var repaired = try index.search(t.allocator, "term", .{ .limit = 1 });
+        defer repaired.deinit(t.allocator);
+        try t.expectEqual(@as(usize, 1), repaired.total);
+        try t.expectEqual(@as(usize, 1), repaired.hits.len);
+        try t.expectEqualDeep(expected, repaired.hits[0]);
+    }
+}
+
 test "Index rejects invalid limits, writer conflicts and oversized documents" {
     const tmp = try TempIndex.init();
     defer tmp.deinit();

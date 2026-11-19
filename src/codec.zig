@@ -175,6 +175,10 @@ pub fn decodeDocument(allocator: std.mem.Allocator, bytes: []const u8, max_bytes
 
 // Read the document metadata used for scoring without allocating text or tokens.
 pub fn decodeDocumentLength(bytes: []const u8, max_bytes: usize) !u64 {
+    return (try decodeDocumentMetadata(bytes, max_bytes)).logical_length;
+}
+
+pub fn decodeDocumentMetadata(bytes: []const u8, max_bytes: usize) !ScoringMetadata {
     var reader: Reader = .{ .bytes = bytes };
     try expectHeader(&reader, document_magic);
     const logical_length = try reader.readU64();
@@ -199,7 +203,7 @@ pub fn decodeDocumentLength(bytes: []const u8, max_bytes: usize) !u64 {
         previous_position = position;
     }
     if (!reader.finished()) return error.CorruptRecord;
-    return logical_length;
+    return .{ .text_bytes = text_len, .logical_length = @intCast(logical_length) };
 }
 
 fn decodeToken(allocator: std.mem.Allocator, reader: *Reader, max_bytes: usize, logical_length: u64, initialized: usize, previous_position: u64) !analysis.Token {
@@ -323,6 +327,10 @@ test "document round trip preserves bytes, terms, positions, and u64 extremes" {
     defer decoded.deinit();
     try std.testing.expectEqualStrings("raw text", decoded.text);
     try std.testing.expectEqual(@as(u64, 5), decoded.logical_length);
+    const metadata = try decodeDocumentMetadata(encoded, 100);
+    try std.testing.expectEqual(@as(u32, 8), metadata.text_bytes);
+    try std.testing.expectEqual(@as(u32, 5), metadata.logical_length);
+    try std.testing.expectEqual(decoded.logical_length, try decodeDocumentLength(encoded, 100));
     try std.testing.expectEqualStrings("中", decoded.tokens[1].term);
 }
 
