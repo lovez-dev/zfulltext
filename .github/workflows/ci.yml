@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2025
+          - macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Read pinned Zig version
+        id: zig-version
+        shell: bash
+        run: |
+          version="$(cat .zigversion)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+          cache-key: ${{ hashFiles('build.zig.zon', '.zigversion') }}
+
+      - name: Verify Zig version
+        shell: bash
+        env:
+          ZIG_VERSION: ${{ steps.zig-version.outputs.version }}
+        run: test "$(zig version)" = "$ZIG_VERSION"
+
+      - name: Verify macOS runner architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon src tests examples bench
+
+      - name: Compile checks
+        run: zig build check
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Run example
+        run: zig build example
