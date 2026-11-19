@@ -10,11 +10,13 @@ zfulltext is an embedded full-text search library. Applications supply an alloca
 - `src/codec.zig`: versioned binary records, collision-free key encoding, and defensive decoding.
 - `src/scoring.zig`: BM25 calculation and deterministic ordering.
 - `src/index.zig`: stable database allocation, mutation/read locking, atomic document replacement, and lifecycle.
-- `src/query.zig`: ordered posting merge, positional phrase verification, BM25 candidate scoring, cancellation, and bounded Top-K selection. Index owns storage and consistent locking; query owns analyzed query terms and reads a consistent posting snapshot under the Index lock.
+- `src/query.zig`: shortest-list intersections for all/phrase queries, ordered posting union for any queries, positional phrase verification, BM25 candidate scoring, cancellation, and bounded Top-K selection. Index owns storage and consistent locking; query owns analyzed query terms and reads a consistent posting snapshot under the Index lock.
 - `tests/`: public API, persistence, consistency, failure, and differential tests.
 - `examples/basic.zig`: complete runnable consumer, including all cleanup.
 - `bench/main.zig`: zlap benchmarks with deterministic runtime workloads.
 - `docs/api.md`: public API and behavioral/lifecycle constraints.
+
+Posting scans still materialize the complete range in wiskdb. Query decoding uses one caller-owned allocation per term for posting descriptors and positions; it releases these buffers before returning. Top-K entries retain the metadata already read for scoring and compare it against complete document records without a second metadata lookup. The query-wide read lock keeps both reads in one logical index state.
 
 No generic storage abstraction, plugin framework, custom thread pool, RPC service, or distributed protocol is required. No Groonga source is copied or translated.
 

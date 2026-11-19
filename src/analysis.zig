@@ -71,12 +71,6 @@ fn emit(allocator: std.mem.Allocator, list: *std.ArrayList(Token), term: []const
     try list.append(allocator, .{ .term = owned_term, .position = position, .length = length });
 }
 
-fn appendEncoded(allocator: std.mem.Allocator, list: *std.ArrayList(u8), codepoint: u21) !void {
-    var buffer: [4]u8 = undefined;
-    const n = std.unicode.utf8Encode(codepoint, &buffer) catch return error.InvalidUtf8;
-    try list.appendSlice(allocator, buffer[0..n]);
-}
-
 pub fn analyze(allocator: std.mem.Allocator, text: []const u8, query: bool) !Tokens {
     try validateUtf8(text);
     var output: std.ArrayList(Token) = .empty;
@@ -94,33 +88,27 @@ pub fn analyze(allocator: std.mem.Allocator, text: []const u8, query: bool) !Tok
             const word = try allocator.alloc(u8, end - offset);
             errdefer allocator.free(word);
             for (text[offset..end], 0..) |byte, i| word[i] = std.ascii.toLower(byte);
-            try emit(allocator, &output, word, position, 1);
-            allocator.free(word);
-            position = try std.math.add(u64, position, 1);
+            const next_position = try std.math.add(u64, position, 1);
+            try output.append(allocator, .{ .term = word, .position = position, .length = 1 });
+            position = next_position;
             offset = end;
             continue;
         }
         if (isHan(unit.codepoint)) {
-            var run: std.ArrayList(Unit) = .empty;
-            defer run.deinit(allocator);
-            var end = offset;
-            while (end < text.len) {
-                const next = try decode(text, end);
-                if (!isHan(next.codepoint)) break;
-                try run.append(allocator, next);
-                end = next.end;
-            }
-            for (run.items, 0..) |han, i| {
-                const token_position = try std.math.add(u64, position, @intCast(i));
-                if (!query or run.items.len == 1) {
-                    try emit(allocator, &output, text[han.start..han.end], token_position, 1);
+            var current = unit;
+            while (true) {
+                const next = if (current.end < text.len) try decode(text, current.end) else null;
+                const following_han = if (next) |n| if (isHan(n.codepoint)) n else null else null;
+                if (!query or (current.start == offset and following_han == null)) {
+                    try emit(allocator, &output, text[current.start..current.end], position, 1);
                 }
-                if (i + 1 < run.items.len) {
-                    try emit(allocator, &output, text[han.start..run.items[i + 1].end], token_position, 2);
-                }
+                position = try std.math.add(u64, position, 1);
+                if (following_han) |han| {
+                    try emit(allocator, &output, text[current.start..han.end], position - 1, 2);
+                    current = han;
+                } else break;
             }
-            position = try std.math.add(u64, position, @intCast(run.items.len));
-            offset = end;
+            offset = current.end;
             continue;
         }
         if (unit.codepoint < 128 or isSeparator(unit.codepoint)) {
@@ -128,10 +116,7 @@ pub fn analyze(allocator: std.mem.Allocator, text: []const u8, query: bool) !Tok
             continue;
         }
         // Other scripts are conservatively indexed as single codepoint tokens.
-        var encoded: std.ArrayList(u8) = .empty;
-        defer encoded.deinit(allocator);
-        try appendEncoded(allocator, &encoded, unit.codepoint);
-        try emit(allocator, &output, encoded.items, position, 1);
+        try emit(allocator, &output, text[unit.start..unit.end], position, 1);
         position = try std.math.add(u64, position, 1);
         offset = unit.end;
     }
@@ -189,6 +174,22 @@ test "single Han query, separators, duplicate terms, and empty text" {
     try std.testing.expectEqual(@as(usize, 0), empty.items.len);
 }
 
+test "streaming Han runs preserve final grams and independent token storage" {
+    var input = [_]u8{ 0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87, 0xe5, 0xad, 0x97 };
+    var document = try analyzeDocument(std.testing.allocator, &input);
+    defer document.deinit();
+    var query = try analyzeQuery(std.testing.allocator, &input);
+    defer query.deinit();
+    @memset(&input, 0);
+    try std.testing.expectEqual(@as(usize, 5), document.items.len);
+    try std.testing.expectEqual(@as(usize, 2), query.items.len);
+    try std.testing.expectEqualStrings("中文", query.items[0].term);
+    try std.testing.expectEqualStrings("文字", query.items[1].term);
+    try std.testing.expectEqual(@as(u64, 1), query.items[1].position);
+    try std.testing.expectEqual(@as(u64, 3), query.logical_length);
+    try std.testing.expectEqualStrings("字", document.items[4].term);
+}
+
 test "invalid UTF-8 is rejected" {
     try std.testing.expectError(error.InvalidUtf8, validateUtf8(&.{ 0xc0, 0x80 }));
     try std.testing.expectError(error.InvalidUtf8, validateUtf8(&.{ 0xe2, 0x82 }));
@@ -202,4 +203,13 @@ test "all analyzer allocation failures clean up" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Context.run, .{});
+    const Mixed = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var document = try analyzeDocument(allocator, "ASCII words 中文字 Ελληνικά");
+            defer document.deinit();
+            var query = try analyzeQuery(allocator, "ASCII words 中文字 Ελληνικά");
+            defer query.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Mixed.run, .{});
 }

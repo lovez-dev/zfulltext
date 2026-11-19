@@ -107,6 +107,7 @@ test "Index.search validates query options, observes cancellation and cleans cal
     flag.cancel();
     try t.expectError(error.Canceled, index.search(t.allocator, "good", .{ .limit = 1, .cancel = &flag }));
     try t.checkAllAllocationFailures(t.allocator, searchWithAllocator, .{index});
+    try t.checkAllAllocationFailures(t.allocator, searchModesWithAllocator, .{index});
     try index.close();
     try t.expectError(error.IndexClosed, index.search(t.allocator, "good", .{ .limit = 1 }));
 }
@@ -125,6 +126,52 @@ test "Index enforces a lower read limit when reopening existing documents" {
     try t.expectError(error.RecordTooLarge, index.get(t.allocator, 3));
     try t.expectError(error.RecordTooLarge, index.search(t.allocator, "document", .{ .limit = 1 }));
     try t.expectError(error.RecordTooLarge, index.search(t.allocator, "document", .{ .limit = 0 }));
+}
+
+test "selective intersections preserve scores term order phrases and exact totals" {
+    const tmp = try TempIndex.init();
+    defer tmp.deinit();
+    const index = try zft.Index.open(t.allocator, t.io, &tmp.path, .{ .create_if_missing = true, .durability = .async });
+    defer index.deinit();
+    for (0..96) |id| {
+        const text = if (id == 17 or id == 61) "common rare tail" else if (id == 42) "common tail rare" else "common ordinary tail";
+        try index.upsert(id, text);
+    }
+    try index.upsert(std.math.maxInt(u64), "common rare tail");
+    var union_result = try index.search(t.allocator, "common rare tail", .{ .mode = .any, .limit = 100 });
+    defer union_result.deinit(t.allocator);
+    for ([_][]const u8{ "common rare tail", "rare common tail", "tail common rare" }) |query| {
+        var result = try index.search(t.allocator, query, .{ .limit = 100 });
+        defer result.deinit(t.allocator);
+        try t.expectEqual(@as(usize, 4), result.total);
+        try t.expectEqual(@as(usize, 4), result.hits.len);
+        var at: usize = 0;
+        for (union_result.hits) |hit| {
+            if (hit.id != 17 and hit.id != 42 and hit.id != 61 and hit.id != std.math.maxInt(u64)) continue;
+            try t.expectEqual(hit.id, result.hits[at].id);
+            try t.expectApproxEqAbs(hit.score, result.hits[at].score, 1e-12);
+            at += 1;
+        }
+    }
+    try expectMatches(index, "common rare tail", .{ .mode = .phrase }, 3, &.{ 17, 61, std.math.maxInt(u64) });
+    try expectMatches(index, "common tail rare", .{ .mode = .phrase }, 1, &.{42});
+    try expectMatches(index, "common rare tail", .{ .limit = 0 }, 4, &.{});
+    try expectMatches(index, "rare common tail", .{ .limit = 1 }, 4, &.{17});
+    try t.expect(try index.delete(17));
+    try index.upsert(61, "ordinary");
+    try expectMatches(index, "common rare tail", .{ .mode = .phrase }, 1, &.{std.math.maxInt(u64)});
+    try expectMatches(index, "common rare tail", .{ .limit = 1 }, 2, &.{42});
+    try expectMatches(index, "rare absent common", .{}, 0, &.{});
+}
+
+fn searchModesWithAllocator(allocator: std.mem.Allocator, index: *zft.Index) !void {
+    for ([_]zft.MatchMode{ .all, .any, .phrase }) |mode| {
+        for ([_]usize{ 0, 1, 4 }) |limit| {
+            var result = try index.search(allocator, "good 中国 x", .{ .mode = mode, .limit = limit });
+            defer result.deinit(allocator);
+            try t.expectEqual(@as(usize, if (mode == .any) 2 else 0), result.total);
+        }
+    }
 }
 
 fn searchWithAllocator(allocator: std.mem.Allocator, index: *zft.Index) !void {

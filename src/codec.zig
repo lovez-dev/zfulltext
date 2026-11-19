@@ -234,19 +234,65 @@ pub fn encodePosting(allocator: std.mem.Allocator, document_id: u64, positions: 
 }
 
 pub fn decodePosting(allocator: std.mem.Allocator, bytes: []const u8, max_positions: usize) !Posting {
+    const count = try postingPositionCount(bytes, max_positions);
+    const positions = try allocator.alloc(u64, count);
+    errdefer allocator.free(positions);
+    return decodePostingInto(bytes, positions);
+}
+
+/// Validate a posting header and exact payload size without allocating.
+pub fn postingPositionCount(bytes: []const u8, max_positions: usize) !usize {
+    var reader: Reader = .{ .bytes = bytes };
+    try expectHeader(&reader, posting_magic);
+    _ = try reader.readU64();
+    const count = try reader.readU32();
+    if (count == 0 or count > max_positions or count != (bytes.len - reader.offset) / 8 or (bytes.len - reader.offset) % 8 != 0)
+        return error.CorruptRecord;
+    return count;
+}
+
+/// Decode into caller storage; the returned positions remain valid with that storage.
+/// The caller frees the original storage, rather than calling Posting.deinit.
+pub fn decodePostingInto(bytes: []const u8, positions: []u64) !Posting {
     var reader: Reader = .{ .bytes = bytes };
     try expectHeader(&reader, posting_magic);
     const document_id = try reader.readU64();
     const count = try reader.readU32();
-    if (count == 0 or count > max_positions or @as(usize, count) > bytes.len / 8) return error.CorruptRecord;
-    const positions = try allocator.alloc(u64, count);
-    errdefer allocator.free(positions);
+    if (count == 0 or count != positions.len) return error.CorruptRecord;
     for (positions, 0..) |*position, i| {
         position.* = try reader.readU64();
         if (i != 0 and position.* <= positions[i - 1]) return error.CorruptRecord;
     }
     if (!reader.finished()) return error.CorruptRecord;
     return .{ .document_id = document_id, .positions = positions };
+}
+
+test "posting caller storage validates header count positions and truncation" {
+    const allocator = std.testing.allocator;
+    const encoded = try encodePosting(allocator, std.math.maxInt(u64), &.{ 0, 3, 127 });
+    defer allocator.free(encoded);
+    try std.testing.expectEqual(@as(usize, 3), try postingPositionCount(encoded, 3));
+    var storage: [3]u64 = undefined;
+    const posting = try decodePostingInto(encoded, &storage);
+    try std.testing.expect(posting.positions.ptr == &storage);
+    try std.testing.expectEqual(std.math.maxInt(u64), posting.document_id);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 3, 127 }, posting.positions);
+    try std.testing.expectError(error.CorruptRecord, postingPositionCount(encoded, 2));
+    try std.testing.expectError(error.CorruptRecord, decodePostingInto(encoded, storage[0..2]));
+    for (0..encoded.len) |len| {
+        try std.testing.expectError(error.CorruptRecord, postingPositionCount(encoded[0..len], 3));
+        try std.testing.expectError(error.CorruptRecord, decodePostingInto(encoded[0..len], &storage));
+    }
+    const duplicate = try allocator.dupe(u8, encoded);
+    defer allocator.free(duplicate);
+    @memcpy(duplicate[duplicate.len - 8 ..], duplicate[duplicate.len - 16 ..][0..8]);
+    try std.testing.expectError(error.CorruptRecord, decodePostingInto(duplicate, &storage));
+    const trailing = try allocator.alloc(u8, encoded.len + 1);
+    defer allocator.free(trailing);
+    @memcpy(trailing[0..encoded.len], encoded);
+    trailing[encoded.len] = 0;
+    try std.testing.expectError(error.CorruptRecord, postingPositionCount(trailing, 3));
+    try std.testing.expectError(error.CorruptRecord, decodePostingInto(trailing, &storage));
 }
 
 pub fn documentKey(allocator: std.mem.Allocator, document_id: u64) ![]u8 {
